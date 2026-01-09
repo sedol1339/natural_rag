@@ -1,0 +1,13 @@
+# Home
+
+|  |
+| --- |
+| Welcome to the official **Betweenlands Mod Wiki**  The ultimate source of information about all things related to The Betweenlands mod.  We currently have 745 articles. |
+
+|  |  |  |
+| --- | --- | --- |
+| About The Betweenlands  **The Betweenlands** is a mod for the sandbox construction game, Minecraft. This large and expansive mod adds a whole new dimension along with tons of its own blocks, mobs, items, game mechanics, and even music.  The Betweenlands is currently in development and new features are constantly being added, so stick around for updates!  **IMPORTANT:** If you intend to either comment or edit on this wiki, be sure to read the Wiki Rules first! | | Play it!  The Betweenlands  Compatible with Minecraft versions:  **1.12.2** - Latest version: **Release 3.9.6**  **1.10.2** - Latest version: **Beta 2.0.4**  **1.7.10** - Latest version: **Beta 1.0.6**  Version History |
+
+|  |  |  |  |  |
+| --- | --- | --- | --- | --- |
+| Gameplay  Explanation of the various features used in *The Betweenlands*.  **Recipes**   * Crafting * Smelting * Smoking * Purifying * Filtering * Grinding * Steeping * Animating   **Other Processes**   * Composting * Trimming * Water Filtering * Infusing * Censing   **Tutorials**   * Installation * How to Get There * Basic Guide to Survival * Farming * Fishing * Herblore * Configuration   **Credits** | Mod Content  Blocks  Detailed information on the various blocks available in *the Betweenlands*.  Items  Detailed information on the various items available in *the Betweenlands*.  Environment  Information about all the environmental aspects of *the Betweenlands*.  Mobs  Information about the various friendly and non-friendly creatures found in *the Betweenlands*.  Mechanics  A list of game mechanics added by *the Betweenlands*.  Lore  Information on the lore surrounding *the Betweenlands*. | Keep updated!  Twitter   |  |  | | --- | --- | | Links  The Betweenlands Links   * Official Forum Thread * Official Curseforge Page * Official Twitter Account * The Betweenlands Github Repository   For mod discussion, join our Discord:   * Official Discord Server | Community  We are currently maintaining 745 articles!  Recent changes | Templates | Random page  Register  Register an account to keep track of your contributions, as well as gaining more features to use.  Community portal  Wiki Rules  Frequently Asked Questions | |
