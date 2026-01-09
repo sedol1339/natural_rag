@@ -1,4 +1,4 @@
-Loading dataset:
+Loading the dataset:
 
 ```
 from natural_rag.dataset import RAGDataset
