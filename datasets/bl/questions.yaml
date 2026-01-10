@@ -7,6 +7,10 @@
   - score: 0
     check: Optionally mention that this is possible by obtaining a Swamp Talisman
       via creative gamemode.
+  relevant:
+  - doc_id: Release 3.3.9
+    loc:
+    - Added config to let players start in The Betweenlands
   metadata:
     reasoning_type: factual
   reference_answers:
