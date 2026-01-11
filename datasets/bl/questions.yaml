@@ -1298,16 +1298,16 @@
     mushroom seed produces no more than 1 seed when grown and harvested.
   eval_rules:
   - score: 1
-    check: Answer positively.
+    check: Answer that they can be multiplied.
   relevant:
   - doc_id: Spores
     loc:
     - Spores are seed-like items that can be grown
     - When harvested at full maturity
   metadata:
-    reasoning_type: aggregating by negation
+    reasoning_type: factual
   reference_answers:
-  - Yes, When harvested at full maturity, the Yellow Dotted Fungus will drop more
+  - Then can. When harvested at full maturity, the Yellow Dotted Fungus will drop more
     Spores.
 - text: What is that smoldering peat in a mire?
   eval_rules:
