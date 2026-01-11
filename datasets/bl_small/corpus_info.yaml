@@ -16,6 +16,9 @@
 - id: Moss Bed
   title: Moss Bed
   source_ext: .html
+- id: Moss
+  title: Moss
+  source_ext: .html
 - id: Greebling
   title: Greebling
   source_ext: .html
