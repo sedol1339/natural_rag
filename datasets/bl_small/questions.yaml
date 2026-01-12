@@ -31,7 +31,7 @@
     metadata:
       comment: Mentioning other armor varieties is a mistake for early game.
   - score: 1
-    check: Mention Sulfur Torches.
+    check: Mention Sulfur Torches or Bulb-Capped Mushroom (at lest one of them).
     metadata:
       comment: While torches are not mentioned in the Basic Guide to Survival, the
         guide says that the realm is dark. Also the wiki says that Sulfur Torch provides
