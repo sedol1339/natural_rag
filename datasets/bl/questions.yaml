@@ -1615,7 +1615,9 @@
     check: Mention Lightweight Draught.
   - score: 1
     check: Mention Boots of the Marsh Runner.
-  - score: 0
+  - score: 1
+    check: Mention Harlequin Toad.
+  - score: 1
     check: Mention a Weedwood Rowboat (or simply a "boat").
   relevant:
   - doc_id: Lurker Skin Armor
@@ -1645,6 +1647,9 @@
   - doc_id: Weedwood Rowboat
     loc:
     - The Weedwood Rowboat is a vehicle that
+  - doc_id: Harlequin Toad
+    loc:
+    - The toad transports its player very
   metadata:
     reasoning_type: factual wide
     comment: This is hard to make an exhaustive list of things.
@@ -1653,7 +1658,7 @@
     You can also use a Weedwood Rowboat. You can craft a Lake Broth drinkable brew
     for Water Breathing. You can make a Brew of the Cat's Eye infusion for Night Vision.
     You can use Lightweight Draught infusion or Boots of the Marsh Runner to walk
-    on water.
+    on water. Finally, you can tame a Harlequin Toad to swim on.
 - text: What can be used as a torch underwater?
   eval_rules:
   - score: 1
