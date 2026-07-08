@@ -11,6 +11,7 @@ from lightrag.llm.openai import openai_complete_if_cache
 from lightrag.utils import EmbeddingFunc
 
 from natural_rag.dataset import RAGDataset
+from natural_rag.paths import resolve_run_dirs
 from natural_rag.pipelines.lightrag_pipelines import LightRAGPipeline
 
 
@@ -27,6 +28,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(os.environ.get("OUTPUT_DIR", "generated/lightrag")),
         help="Output directory for index and answers.",
+    )
+    parser.add_argument(
+        "--index-model",
+        default=os.environ.get("INDEX_MODEL"),
+        help="Label of the model that BUILT the graph (e.g. gpt-oss-20b). "
+             "When set, inserted into the index/answers path as a subdirectory.",
     )
     parser.add_argument(
         "--build-index",
@@ -46,6 +53,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--query-mode",
         default=os.environ.get("QUERY_MODE", "naive"),
+    )
+    parser.add_argument(
+        "--short-answers",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("SHORT_ANSWERS", "").lower() in ("1", "true", "yes"),
+        help="Use a brief answer style (for short-answer benchmarks).",
+    )
+    parser.add_argument(
+        "--llm-cache",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LLM_CACHE", "true").lower() in ("1", "true", "yes"),
+        help="Use LightRAG's LLM response cache (default ON). Pass "
+             "--no-llm-cache to force fresh regeneration if a stale response "
+             "cache is present in the index.",
     )
     parser.add_argument(
         "--max-parallel-insert",
@@ -117,10 +138,10 @@ def main() -> None:
         raise ValueError("OPENAI_API_KEY is required")
 
     dataset = RAGDataset.load_auto(args.dataset_path)
-    dataset_name = args.dataset_path.stem if args.dataset_path.is_file() else args.dataset_path.name
-    
-    index_dir = args.output_dir / dataset_name / "index"
-    answers_dir = args.output_dir / dataset_name / "answers"
+
+    index_dir, answers_dir, _ = resolve_run_dirs(
+        args.output_dir, args.dataset_path, args.index_model
+    )
     index_dir.mkdir(parents=True, exist_ok=True)
     answers_dir.mkdir(parents=True, exist_ok=True)
 
@@ -136,6 +157,8 @@ def main() -> None:
         ),
         query_mode=args.query_mode,
         max_parallel_insert=args.max_parallel_insert,
+        short_answers=args.short_answers,
+        enable_llm_cache=args.llm_cache,
     )
 
     if args.build_index:

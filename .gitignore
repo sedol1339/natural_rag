@@ -1,5 +1,7 @@
 tmp/
 generated/
+generated_all_answers/
+reeval_cheatsheet.pdf
 .vscode/
 llm_cache/
 

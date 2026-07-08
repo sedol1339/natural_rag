@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,9 +17,34 @@ from ragu import (
     TwoStageArtifactsExtractorLLM,
 )
 from ragu.common.logger import logger as ragu_logger
+from ragu.common.prompts.messages import ChatMessages, UserMessage
+from ragu.common.prompts.prompt_storage import RAGUInstruction
 from ragu.models.embedder import Embedder
 from ragu.models.llm import LLM
 from ragu.search_engine.local_search import LocalSearchEngine
+from ragu.search_engine.naive_search import NaiveSearchEngine
+
+
+# Brief-answer prompt used when reference answers are short (e.g. bioasq,
+# musique, 2wikimultihopqa). Mirrors DEFAULT_RESPONSE_ONLY_PROMPT's jinja
+# variables ({{ query }}, {{ context }}, {{ language }}) but forces a terse,
+# extractive answer so the answer length matches the short gold answers.
+SHORT_ANSWER_PROMPT = """
+**Goal**
+Answer the query as briefly as possible using the context.
+
+**Instructions**
+1. Output ONLY the direct answer: a single entity, name, number, date, or a
+   short semicolon-separated list of such items.
+2. No explanations, no full sentences, no restating of the question, no
+   markdown, no citations.
+3. If the answer is not supported by the context, output exactly: I don't know.
+
+Query: {{ query }}
+Context: {{ context }}
+
+Provide the answer in the following language: {{ language }}
+"""
 
 
 class RAGUPipeline(RAGPipeline):
@@ -42,6 +68,7 @@ class RAGUPipeline(RAGPipeline):
         tokenizer_llm_name: str = "gpt-4o",
         tokenizer_embedder_name: str = "gpt-4o",
         query_engine: str = "local",
+        short_answers: bool = False,
     ):
         ragu_logger.remove()
         ragu_logger.add(sys.stdout, level="DEBUG")
@@ -125,35 +152,85 @@ class RAGUPipeline(RAGPipeline):
             make_community_summary=False,
         )
 
+        # Pass only kwargs the installed RAGU version's KnowledgeGraph accepts
+        # (its signature has drifted across versions: tokenizer/embedder-token
+        # args were removed).
+        kg_kwargs: dict[str, Any] = {
+            "llm": self.builder_llm,
+            "embedder": self.embedder,
+            "chunker": self.chunker,
+            "artifact_extractor": self.artifact_extractor,
+            "builder_settings": self.builder_settings,
+            "language": self.language,
+            "embedder_token_limit": 8000,
+            "tokenizer_backend": tokenizer_backend,
+            "tokenizer_llm_name": tokenizer_llm_name,
+            "tokenizer_embedder_name": tokenizer_embedder_name,
+        }
+        kg_params = inspect.signature(KnowledgeGraph.__init__).parameters
         self.knowledge_graph = KnowledgeGraph(
-            llm=self.builder_llm,
-            embedder=self.embedder,
-            chunker=self.chunker,
-            artifact_extractor=self.artifact_extractor,
-            builder_settings=self.builder_settings,
-            embedder_token_limit=8000,
-            tokenizer_backend=tokenizer_backend,
-            tokenizer_llm_name=tokenizer_llm_name,
-            tokenizer_embedder_name=tokenizer_embedder_name,
+            **{k: v for k, v in kg_kwargs.items() if k in kg_params}
         )
 
-        local_search = LocalSearchEngine(
-            self.assistant_llm,
-            self.knowledge_graph,
-            self.embedder,
-            tokenizer_model="gpt-4o-mini",
-            language=self.language,
-        )
-        self.search_engine = QueryPlanEngine(local_search) if query_engine == "query_plan" else local_search
+        self.query_engine = query_engine
+
+        def _short_instruction() -> RAGUInstruction:
+            return RAGUInstruction(
+                messages=ChatMessages.from_messages(
+                    [UserMessage(content=SHORT_ANSWER_PROMPT)]
+                ),
+                pydantic_model=str,
+                description="Brief extractive answer prompt for short-answer benchmarks.",
+            )
+
+        if query_engine == "naive":
+            # Naive = plain vector RAG over chunks (uses the same RAGU index:
+            # chunk vector DB + chunk KV). Graph/entities are not traversed.
+            naive_search = NaiveSearchEngine(
+                self.assistant_llm,
+                self.knowledge_graph,
+                self.embedder,
+                tokenizer_model="gpt-4o-mini",
+                language=self.language,
+            )
+            if short_answers:
+                naive_search.update_prompt("naive_search", _short_instruction())
+            self.search_engine = naive_search
+        else:
+            local_search = LocalSearchEngine(
+                self.assistant_llm,
+                self.knowledge_graph,
+                self.embedder,
+                tokenizer_model="gpt-4o-mini",
+                language=self.language,
+            )
+            self.local_search = local_search
+            if short_answers:
+                local_search.update_prompt("local_search", _short_instruction())
+            self.search_engine = QueryPlanEngine(local_search) if query_engine == "query_plan" else local_search
 
     def build_index(self, documents: list[Document]):
         docs = [doc.text for doc in documents if doc.text]
         asyncio.run(self.knowledge_graph.build_from_docs(docs))
 
     async def _answer(self, question: str, max_retries: int = 3) -> tuple[str, Any]:
+        # NaiveSearchEngine.a_query does not accept `use_chunks`; only pass it
+        # for the graph engines (local / query_plan).
+        qa_kwargs = {} if self.query_engine == "naive" else {"use_chunks": True}
+        context: Any = None
         for attempt in range(max_retries):
-            context = await self.search_engine.a_search(question, top_k=self.retrieval_top_k)
-            response = await self.search_engine.a_query(question, top_k=self.qa_top_k, use_chunks=True)
+            try:
+                context = await self.search_engine.a_search(question, top_k=self.retrieval_top_k)
+                response = await self.search_engine.a_query(question, top_k=self.qa_top_k, **qa_kwargs)
+            except Exception as exc:
+                # A single bad question (e.g. provider content-filter 400, which
+                # is not retryable) must not crash the whole batch. Log and
+                # return a refusal placeholder so the run continues.
+                ragu_logger.warning(
+                    f"Answer generation failed ({type(exc).__name__}: {exc}); "
+                    f"returning 'I don't know.' placeholder for this question."
+                )
+                return "I don't know.", context
             if response.response and response.response.strip():
                 return response.response, context
             ragu_logger.warning(f"Empty answer on attempt {attempt+1}/{max_retries}, retrying...")
@@ -161,3 +238,12 @@ class RAGUPipeline(RAGPipeline):
 
     def generate_answer(self, question: str) -> tuple[str, Any]:
         return asyncio.run(self._answer(question))
+
+    async def a_generate_answer(self, question: str) -> tuple[str, Any]:
+        """Async entry point so a caller can answer many questions inside a
+        single event loop. Using this (instead of per-question ``asyncio.run``
+        via :meth:`generate_answer`) keeps RAGU's shared HTTP client and rate
+        limiters bound to one loop, avoiding cross-loop reuse warnings and the
+        spurious ``APIConnectionError`` retries that come with it.
+        """
+        return await self._answer(question)

@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import inspect
 from pathlib import Path
 from typing import Any, Callable
@@ -8,6 +9,65 @@ from lightrag.utils import EmbeddingFunc
 
 from natural_rag.pipelines import RAGPipeline
 from natural_rag.data import Document
+
+
+# Brief-answer settings used when reference answers are short (bioasq, musique,
+# 2wikimultihopqa). `response_type` is interpolated into LightRAG's answer
+# prompt; `user_prompt` (newer LightRAG only) adds an explicit instruction.
+SHORT_ANSWER_RESPONSE_TYPE = (
+    "a single short phrase: a name, number, date, or a short "
+    "semicolon-separated list, with no explanation"
+)
+SHORT_ANSWER_USER_PROMPT = (
+    "Answer as briefly as possible. Output ONLY the direct answer (a single "
+    "entity, name, number, date, or a short semicolon-separated list). No "
+    "explanations, no full sentences, no markdown, no restating the question."
+)
+
+# LightRAG's built-in rag_response prompt hard-codes a "### References" section
+# and encourages long, structured answers. QueryParam.response_type/user_prompt
+# do NOT remove that, so for short-answer benchmarks we replace the prompt
+# template outright. Only {context_data} is referenced (str.format ignores the
+# other kwargs LightRAG passes, e.g. response_type/user_prompt).
+SHORT_RAG_RESPONSE_PROMPT = """---Role---
+
+You answer the user query using ONLY the information in the provided Context.
+
+---Instructions---
+
+- Output ONLY the direct answer: a single entity, name, number, date, or a short
+  semicolon-separated list of such items.
+- No explanations, no full sentences, no Markdown, no headings.
+- Do NOT output any references, citations, sources, or bibliography section, and
+  do not output any heading. Output nothing after the answer itself.
+- If the answer is not in the Context, output exactly:
+  I don't know.
+
+---Context---
+
+{context_data}
+"""
+
+
+def apply_short_answer_prompts() -> None:
+    """Monkeypatch LightRAG's answer templates to terse, reference-free ones.
+
+    Safe no-op if the installed LightRAG exposes prompts differently.
+    """
+    try:
+        from lightrag.prompt import PROMPTS  # type: ignore
+    except Exception:
+        return
+    for key in ("rag_response", "naive_rag_response"):
+        if key in PROMPTS:
+            PROMPTS[key] = SHORT_RAG_RESPONSE_PROMPT
+
+
+def _supported_query_param(**kwargs: Any) -> QueryParam:
+    """Build a QueryParam passing only fields the installed version supports."""
+    valid = {f.name for f in dataclasses.fields(QueryParam)}
+    filtered = {k: v for k, v in kwargs.items() if k in valid and v is not None}
+    return QueryParam(**filtered)
 
 
 class LightRAGPipeline(RAGPipeline):
@@ -20,8 +80,24 @@ class LightRAGPipeline(RAGPipeline):
         query_mode: str = "hybrid",
         addon_params: dict[str, Any] | None = None,
         max_parallel_insert: int | None = None,
+        short_answers: bool = False,
+        response_type: str | None = None,
+        user_prompt: str | None = None,
+        enable_llm_cache: bool = True,
+        enable_rerank: bool = False,
     ):
         self.query_mode = query_mode
+        self.enable_rerank = enable_rerank
+        # Brief-answer controls. Explicit args win; otherwise `short_answers`
+        # enables the built-in terse settings.
+        self.response_type = response_type or (
+            SHORT_ANSWER_RESPONSE_TYPE if short_answers else None
+        )
+        self.user_prompt = user_prompt or (
+            SHORT_ANSWER_USER_PROMPT if short_answers else None
+        )
+        if short_answers:
+            apply_short_answer_prompts()
 
         self._loop = asyncio.new_event_loop()
         try:
@@ -45,6 +121,12 @@ class LightRAGPipeline(RAGPipeline):
             and 'max_parallel_insert' in lightrag_parameters
         ):
             rag_kwargs['max_parallel_insert'] = max_parallel_insert
+        # Disable LightRAG's LLM response cache so answers are regenerated fresh
+        # with the current prompt (the downloaded index ships a large
+        # kv_store_llm_response_cache.json that would otherwise return stale
+        # answers built with the old prompt).
+        if 'enable_llm_cache' in lightrag_parameters:
+            rag_kwargs['enable_llm_cache'] = enable_llm_cache
 
         self._rag = LightRAG(**rag_kwargs)
 
@@ -86,13 +168,19 @@ class LightRAGPipeline(RAGPipeline):
         self._run(self._rag.ainsert(texts, ids=ids))
 
     def generate_answer(self, question: str) -> tuple[str, Any]:
-        context_param = QueryParam(
+        context_param = _supported_query_param(
             mode=self.query_mode,
             only_need_context=True,
+            enable_rerank=self.enable_rerank,
         )
         context = self._run(self._rag.aquery(question, param=context_param))
 
-        answer_param = QueryParam(mode=self.query_mode)
+        answer_param = _supported_query_param(
+            mode=self.query_mode,
+            response_type=self.response_type,
+            user_prompt=self.user_prompt,
+            enable_rerank=self.enable_rerank,
+        )
         answer = self._run(self._rag.aquery(question, param=answer_param))
 
         return answer, context
