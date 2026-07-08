@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from ragu.models.llm import CachedAsyncOpenAI, LLMOpenAI
 from ragu.models.embedder import EmbedderOpenAI
 
 from natural_rag.dataset import RAGDataset
+from natural_rag.paths import resolve_run_dirs
 from natural_rag.pipelines.ragu_pipelines import RAGUPipeline
 
 
@@ -25,6 +27,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(os.environ.get("OUTPUT_DIR", "generated/ragu")),
         help="Output directory for index and answers.",
+    )
+    parser.add_argument(
+        "--index-model",
+        default=os.environ.get("INDEX_MODEL"),
+        help="Label of the model that BUILT the graph (e.g. gpt-oss-20b). "
+             "When set, inserted into the index/answers path as a subdirectory.",
     )
     parser.add_argument(
         "--build-index",
@@ -98,8 +106,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-completion-tokens",
+        # 16384 is the max completion-token limit of gpt-4o-mini (via litellm);
+        # a higher default triggers a 400 BadRequest. Override for models that
+        # support more.
         type=int,
-        default=int(os.environ.get("MAX_COMPLETION_TOKENS", "100000")),
+        default=int(os.environ.get("MAX_COMPLETION_TOKENS", "16384")),
     )
     parser.add_argument(
         "--builder-model-name",
@@ -136,9 +147,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--query-engine",
-        choices=["local", "query_plan"],
+        choices=["local", "query_plan", "naive"],
         default=os.environ.get("QUERY_ENGINE", "local"),
-        help="Search engine for answering: local (default) or query_plan (decomposes complex queries).",
+        help="Search engine for answering: local (default), query_plan "
+             "(decomposes complex queries), or naive (plain vector RAG over chunks).",
+    )
+    parser.add_argument(
+        "--short-answers",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("SHORT_ANSWERS", "").lower() in ("1", "true", "yes"),
+        help="Use a brief extractive answer prompt (for short-answer benchmarks).",
     )
     parser.add_argument(
         "--tokenizer-backend",
@@ -164,10 +182,10 @@ def main() -> None:
         args.assistant_model_name = args.builder_model_name
 
     dataset = RAGDataset.load_auto(args.dataset_path)
-    dataset_name = args.dataset_path.stem if args.dataset_path.is_file() else args.dataset_path.name
-    
-    index_dir = args.output_dir / dataset_name / "index"
-    answers_dir = args.output_dir / dataset_name / "answers"
+
+    index_dir, answers_dir, _ = resolve_run_dirs(
+        args.output_dir, args.dataset_path, args.index_model
+    )
     index_dir.mkdir(parents=True, exist_ok=True)
     answers_dir.mkdir(parents=True, exist_ok=True)
 
@@ -210,17 +228,25 @@ def main() -> None:
         tokenizer_llm_name=args.tokenizer_llm_name,
         tokenizer_embedder_name=args.tokenizer_embedder_name,
         query_engine=args.query_engine,
+        short_answers=args.short_answers,
     )
 
     if args.build_index:
         pipeline.build_index(documents=list(dataset.documents.values()))
 
     if args.answer:
-        for q_idx, question in enumerate(dataset.questions):
-            answer_path = answers_dir / f'{q_idx}.txt'
-            if not answer_path.exists() or args.force:
-                answer, _ = pipeline.generate_answer(question.text)
+        # Answer all questions within a single event loop so RAGU's shared HTTP
+        # client and rate limiters stay bound to one loop (avoids cross-loop
+        # reuse warnings and spurious APIConnectionError retries).
+        async def _generate_all() -> None:
+            for q_idx, question in enumerate(dataset.questions):
+                answer_path = answers_dir / f'{q_idx}.txt'
+                if answer_path.exists() and not args.force:
+                    continue
+                answer, _ = await pipeline.a_generate_answer(question.text)
                 answer_path.write_text(answer)
+
+        asyncio.run(_generate_all())
 
 
 if __name__ == "__main__":
