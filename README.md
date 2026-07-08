@@ -9,16 +9,29 @@ natural_rag/
 ├── natural_rag/           # Python package
 │   ├── dataset.py         # Dataset loading (YAML, JSONL, JSON auto-detect)
 │   ├── data.py            # Data model
+│   ├── paths.py           # Output-dir resolver (<engine>_<dataset>/<dataset>/[<model>]/...)
 │   ├── dashboard.py       # Dash-based result viewer
 │   ├── baseline/          # Baseline RAG implementations
 │   └── pipelines/         # RAG pipeline wrappers (RAGUPipeline, etc.)
-├── runs/                  # Run scripts for various RAG engines
+├── runs/                  # Run scripts + tooling for various RAG engines
+│   ├── check_index_ready.py         # Verify a downloaded index loads without re-indexing
+│   └── build_graphrag_bench_input.py # Convert answers → GraphRAG-Benchmark eval JSON
 ├── datasets/              # Benchmark datasets (bl_tiny, bl, musique, etc.)
-├── generated/             # Output: indexes + answers
+├── generated/             # Output: indexes + answers (layout below)
 ├── src/                   # Vendored dependencies (graph-ragu)
 ├── build/                 # Build artifacts
 └── pyproject.toml
 ```
+
+Output layout (see `natural_rag/paths.py`):
+
+```
+generated/<engine>_<dataset>/<dataset>/[<index-model>/]{index,answers}
+# e.g. generated/ragu_bioasq/bioasq/gpt-oss-20b/{index,answers}
+```
+
+The `<index-model>` segment (from `--index-model`, e.g. `gpt-oss-20b`) is
+optional and lets graphs built by different models coexist side by side.
 
 ## Setup
 
@@ -73,6 +86,19 @@ uv run python runs/ragu_run.py \
   --embed-batch-size 32
 ```
 
+### Short-answer mode & NaiveRAG
+
+For benchmarks whose gold answers are short (bioasq, musique, 2wikimultihopqa),
+long generations get under-scored. Pass `--short-answers` to make RAGU **and**
+LightRAG emit a terse, extractive answer (a single entity/name/number/date or a
+short `;`-separated list, `I don't know.` when unsupported). For LightRAG this
+also strips its `### References` section.
+
+`ragu_run.py --query-engine naive` runs **NaiveRAG** — plain vector RAG over the
+index's text chunks (no graph traversal), reusing the same RAGU index. Use
+`--index-model <name>` (e.g. `gpt-oss-20b`) to keep graphs from different builder
+models in separate folders.
+
 ## Evaluation
 
 ```bash
@@ -86,6 +112,22 @@ uv run python runs/jsonl_llm_judge_evaluate.py \
   --dataset-name bl_medium \
   --answers-pattern ragu_*.json
 ```
+
+### GraphRAG-Benchmark generation eval
+
+To score answers with [GraphRAG-Benchmark](https://github.com/bond005/GraphRAG-Benchmark)
+(judge `gemini-3-flash-preview`, embedder `text-embedding-3-small`), first build
+the eval input, then run `generation_eval` from that repo:
+
+```bash
+python runs/build_graphrag_bench_input.py \
+  --dataset-path datasets/bioasq \
+  --output-dir generated/ragu_bioasq --index-model gpt-oss-20b
+```
+
+See [runs/README.md](runs/README.md#evaluation-with-graphrag-benchmark) for the
+full flow (input schema, `question_type` → metric mapping, and the
+`generation_eval` command).
 
 ## Dashboard
 

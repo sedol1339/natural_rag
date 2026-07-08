@@ -33,9 +33,14 @@ python runs/ragu_run.py \
 | `--build-index` / `--no-build-index` | `BUILD_INDEX` | `true` | Build index from documents |
 | `--answer` / `--no-answer` | `ANSWER` | `true` | Generate answers |
 | `--force` | `FORCE` | `false` | Overwrite existing answers |
+| `--index-model` | `INDEX_MODEL` | — | Label of the model that **built** the graph (e.g. `gpt-oss-20b`). When set, inserted as a subdirectory into the index/answers path so graphs from different builder models coexist |
+| `--short-answers` / `--no-short-answers` | `SHORT_ANSWERS` | `false` | Terse extractive answer prompt (for short-answer benchmarks like bioasq/musique/2wiki) |
 | `--openai-base-url` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | LLM API base URL |
 | `--embed-base-url` | `EMBED_BASE_URL` | `OPENAI_BASE_URL` | Embedding API base URL |
 | `--openai-api-key` | `OPENAI_API_KEY` | — | API key (required) |
+
+> `--index-model` and `--short-answers` are available in both `ragu_run.py` and
+> `lightrag_run.py`.
 
 ## RAGU-Specific Arguments
 
@@ -48,13 +53,13 @@ python runs/ragu_run.py \
 | `--embed-batch-size` | `EMBED_BATCH_SIZE` | `32` | Max texts per embed API call |
 | `--retrieval-top-k` | `RETRIEVAL_TOP_K` | `20` | Entities to retrieve for context |
 | `--qa-top-k` | `QA_TOP_K` | `20` | Entities for answer generation |
-| `--query-engine` | `QUERY_ENGINE` | `local` | `local` or `query_plan` |
+| `--query-engine` | `QUERY_ENGINE` | `local` | `local`, `query_plan`, or `naive` |
 | `--chunker` | `CHUNKER` | `simple` | `simple` or `smart` |
 | `--use-chunks` / `--no-use-chunks` | `USE_CHUNKS` | `true` | Use text chunks in queries |
 | `--use-summary` / `--no-use-summary` | `USE_SUMMARY` | `false` | Use community summaries |
 | `--simple-chunk-size` | `SIMPLE_CHUNK_SIZE` | `2048` | Chunk size (characters) |
 | `--simple-chunk-overlap` | `SIMPLE_CHUNK_OVERLAP` | `0` | Chunk overlap |
-| `--max-completion-tokens` | `MAX_COMPLETION_TOKENS` | `100000` | Max LLM output tokens |
+| `--max-completion-tokens` | `MAX_COMPLETION_TOKENS` | `16384` | Max LLM output tokens (16384 is the ceiling for `gpt-4o-mini`; raise for models that allow more) |
 | `--openai-rate-min-delay` | `OPENAI_RATE_MIN_DELAY` | `2` | Min delay between requests (s) |
 | `--openai-rate-max-simultaneous` | `OPENAI_RATE_MAX_SIMULTANEOUS` | `10` | Max concurrent requests |
 | `--llm-cache` | `LLM_CACHE` | `tmp/llm_cache` | Response cache directory |
@@ -70,13 +75,20 @@ Single-stage retrieval + LLM answer generation. Good for simple questions.
 ### `query_plan`
 Decomposes complex questions into sub-query DAGs via LLM planning, executes sub-queries in topological order, and returns the final answer. Falls back to the underlying engine when no decomposition is needed.
 
+### `naive`
+Plain vector RAG: retrieves the most similar text **chunks** from the chunk vector DB and answers from them — the knowledge graph (entities/relations) is **not** traversed. Uses the same on-disk RAGU index, so it can reuse an existing graph's index (e.g. symlink the RAGU `index/` into a `generated/naive_<dataset>/` output dir).
+
 ## Output Structure
 
 ```
-<output-dir>/<dataset-name>/
+<output-dir>/<dataset-name>/[<index-model>/]
 ├── index/       # Built index (vectors + graph)
 └── answers/     # Generated answers (0.txt, 1.txt, ...)
 ```
+
+The `<index-model>` segment is present only when `--index-model` is passed
+(e.g. `generated/ragu_bioasq/bioasq/gpt-oss-20b/{index,answers}`); otherwise the
+layout is `<output-dir>/<dataset-name>/{index,answers}`.
 
 ## Environment Variables (RAGU)
 
@@ -122,6 +134,17 @@ python runs/lightrag_run.py \
   --embedding-dim 1536 \
   --query-mode naive
 ```
+
+LightRAG-specific extras (besides the shared `--index-model` / `--short-answers`):
+
+| Argument | Env Var | Default | Description |
+|----------|---------|---------|-------------|
+| `--query-mode` | `QUERY_MODE` | `naive` | `naive` / `local` / `global` / `hybrid` / `mix` |
+| `--llm-cache` / `--no-llm-cache` | `LLM_CACHE` | on | Use LightRAG's LLM response cache. Pass `--no-llm-cache` to force fresh regeneration when a stale response cache ships inside the index |
+
+> `--short-answers` for LightRAG replaces its built-in `rag_response` /
+> `naive_rag_response` templates with terse, reference-free ones (removes the
+> `### References` section and long-form output).
 
 ### NanoGraphRAG
 ```bash
@@ -298,6 +321,61 @@ Environment variables (see `.env.wikontic.example`):
 | `WIKONTIC_HOP_DEPTH` | `5` | Multi-hop traversal depth |
 
 Fallback chain: **key** — `WIKONTIC_API_KEY` → `OPENAI_API_KEY` → `KEY` → `OPENROUTER_KEY`; **base_url** — `WIKONTIC_BASE_URL` → `OPENAI_BASE_URL` → `OPENROUTER_BASE_URL`; **model** — `WIKONTIC_MODEL` → `LLM_MODEL` → `gpt-4o`. So `ragu_run.py` env vars (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `LLM_MODEL`) also work for Wikontic with no extra config.
+
+## Index Readiness Check
+
+`runs/check_index_ready.py` verifies a downloaded index is laid out correctly so
+answers can be generated **without** re-indexing.
+
+```bash
+# Create the (model-scoped) folders, then drop the index files into index/
+python runs/check_index_ready.py --engine ragu \
+  --dataset-path datasets/bioasq --output-dir generated/ragu_bioasq \
+  --index-model gpt-oss-20b --make-dirs
+
+# Full probe: load the index and answer question 0 (needs live embedder + LLM)
+python runs/check_index_ready.py --engine ragu \
+  --dataset-path datasets/bioasq --output-dir generated/ragu_bioasq \
+  --index-model gpt-oss-20b --probe
+```
+
+- Offline check: confirms required files exist (RAGU: `knowledge_graph.gml`,
+  `vdb_*.json`, `kv_chunks.json`; LightRAG: `graph_chunk_entity_relation.graphml`,
+  `vdb_*.json`, `kv_store_*.json`) and reports the stored `embedding_dim`
+  (must match the answer-time embedder, e.g. 768 for `gte-multilingual-base`).
+- `--make-dirs` creates the `index/` + `answers/` folders. `--probe` loads the
+  pipeline with indexing disabled and generates one answer to prove the graph
+  loads and no re-indexing happens.
+
+## Evaluation with GraphRAG-Benchmark
+
+Convert generated answers into the input JSON expected by
+[GraphRAG-Benchmark](https://github.com/bond005/GraphRAG-Benchmark)'s
+`Evaluation/generation_eval.py`, then run the judge.
+
+```bash
+# 1) Build the eval input (reads the dataset + answers/*.txt)
+python runs/build_graphrag_bench_input.py \
+  --dataset-path datasets/bioasq \
+  --output-dir generated/ragu_bioasq --index-model gpt-oss-20b
+# → generated/ragu_bioasq/bioasq/gpt-oss-20b/graphrag_bench_input.json
+
+# 2) Score it (from the GraphRAG-Benchmark repo / its own env)
+export LLM_API_KEY="..."
+python -m Evaluation.generation_eval --mode API \
+  --model gemini-3-flash-preview --base_url "https://api.vsellm.ru/v1" \
+  --embedding_model text-embedding-3-small \
+  --embedding_base_url "https://api.vsellm.ru/v1" \
+  --data_file <path>/graphrag_bench_input.json \
+  --output_file <path>/eval_results.json --detailed_output
+```
+
+Each item carries `id`, `question`, `source`, `context`, `evidence`,
+`question_type`, `generated_answer`, `ground_truth`. `question_type` maps to the
+metrics: `Fact Retrieval` (bioasq) and `Complex Reasoning` (musique / 2wiki)
+both use `rouge_score` + `answer_correctness`. The judge model
+(`gemini-3-flash-preview`) and embedder (`text-embedding-3-small`) are used
+**only** inside the eval script — they are unrelated to answer generation.
 
 ## Evaluation Scripts
 
