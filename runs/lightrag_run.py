@@ -51,6 +51,18 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
+        "--limit-docs",
+        type=int,
+        default=int(os.environ.get("LIMIT_DOCS", "0")) or None,
+        help="Index only the first N documents (smoke tests).",
+    )
+    parser.add_argument(
+        "--limit-questions",
+        type=int,
+        default=int(os.environ.get("LIMIT_QUESTIONS", "0")) or None,
+        help="Answer only the first N questions (smoke tests).",
+    )
+    parser.add_argument(
         "--query-mode",
         default=os.environ.get("QUERY_MODE", "naive"),
     )
@@ -138,6 +150,52 @@ def main() -> None:
         raise ValueError("OPENAI_API_KEY is required")
 
     dataset = RAGDataset.load_auto(args.dataset_path)
+    if args.limit_docs is not None or args.limit_questions is not None:
+        documents = (
+            dict(list(dataset.documents.items())[: args.limit_docs])
+            if args.limit_docs is not None
+            else dataset.documents
+        )
+        questions = dataset.questions
+        if args.limit_docs is not None:
+            if args.limit_questions is not None:
+                # Порядок корпуса не связан с вопросами: первые попавшиеся
+                # доки может не касаться ни один вопрос. Поэтому срез для
+                # смоука собираем из доков, на которые ссылаются первые N
+                # вопросов, и только потом добираем корпусом до лимита.
+                wanted: list[str] = []
+                seen_ids: set[str] = set()
+                for q in questions[: args.limit_questions]:
+                    for source in q.relevant or []:
+                        if source.doc_id in dataset.documents and source.doc_id not in seen_ids:
+                            seen_ids.add(source.doc_id)
+                            wanted.append(source.doc_id)
+                rest = [i for i in dataset.documents if i not in seen_ids]
+                keep_ids = (wanted + rest)[: args.limit_docs]
+                documents = {i: dataset.documents[i] for i in keep_ids}
+            # Вопросы, чьи relevant-источники выпали при обрезке корпуса,
+            # невалидны (check_ids_exist упадёт). Фильтруем по всему списку
+            # и только потом берём первые N — иначе на датасетах, где первые
+            # вопросы ссылаются на отрезанные доки, смоук остался бы без
+            # ни одного ответимого вопроса.
+            answerable = [
+                q for q in questions
+                if q.relevant is None
+                or all(s.doc_id in documents for s in q.relevant)
+            ]
+            dropped = len(questions) - len(answerable)
+            if dropped:
+                print(
+                    f"--limit-docs: {dropped} of {len(questions)} question(s) "
+                    "reference docs outside the kept corpus slice"
+                )
+            if args.limit_questions is not None:
+                questions = answerable[: args.limit_questions]
+            else:
+                questions = answerable
+        elif args.limit_questions is not None:
+            questions = questions[: args.limit_questions]
+        dataset = RAGDataset(documents=documents, questions=questions)
 
     index_dir, answers_dir, _ = resolve_run_dirs(
         args.output_dir, args.dataset_path, args.index_model

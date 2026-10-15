@@ -10,8 +10,9 @@ from ragu.models.llm import CachedAsyncOpenAI, LLMOpenAI
 from ragu.models.embedder import EmbedderOpenAI
 
 from natural_rag.dataset import RAGDataset
-from natural_rag.paths import resolve_run_dirs
+from natural_rag.paths import dataset_name_from_path, resolve_run_dirs
 from natural_rag.pipelines.ragu_pipelines import RAGUPipeline
+from natural_rag.timing import IndexTimer, LLMCallCounter, attach_counter
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +49,18 @@ def parse_args() -> argparse.Namespace:
         "--force",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument(
+        "--limit-docs",
+        type=int,
+        default=int(os.environ.get("LIMIT_DOCS", "0")) or None,
+        help="Index only the first N documents (smoke tests).",
+    )
+    parser.add_argument(
+        "--limit-questions",
+        type=int,
+        default=int(os.environ.get("LIMIT_QUESTIONS", "0")) or None,
+        help="Answer only the first N questions (smoke tests).",
     )
     parser.add_argument(
         "--chunker",
@@ -182,12 +195,60 @@ def main() -> None:
         args.assistant_model_name = args.builder_model_name
 
     dataset = RAGDataset.load_auto(args.dataset_path)
+    if args.limit_docs is not None or args.limit_questions is not None:
+        documents = (
+            dict(list(dataset.documents.items())[: args.limit_docs])
+            if args.limit_docs is not None
+            else dataset.documents
+        )
+        questions = dataset.questions
+        if args.limit_docs is not None:
+            if args.limit_questions is not None:
+                # Порядок корпуса не связан с вопросами: первые попавшиеся
+                # доки может не касаться ни один вопрос. Поэтому срез для
+                # смоука собираем из доков, на которые ссылаются первые N
+                # вопросов, и только потом добираем корпусом до лимита.
+                wanted: list[str] = []
+                seen_ids: set[str] = set()
+                for q in questions[: args.limit_questions]:
+                    for source in q.relevant or []:
+                        if source.doc_id in dataset.documents and source.doc_id not in seen_ids:
+                            seen_ids.add(source.doc_id)
+                            wanted.append(source.doc_id)
+                rest = [i for i in dataset.documents if i not in seen_ids]
+                keep_ids = (wanted + rest)[: args.limit_docs]
+                documents = {i: dataset.documents[i] for i in keep_ids}
+            # Вопросы, чьи relevant-источники выпали при обрезке корпуса,
+            # невалидны (check_ids_exist упадёт). Фильтруем по всему списку
+            # и только потом берём первые N — иначе на датасетах, где первые
+            # вопросы ссылаются на отрезанные доки, смоук остался бы без
+            # ни одного ответимого вопроса.
+            answerable = [
+                q for q in questions
+                if q.relevant is None
+                or all(s.doc_id in documents for s in q.relevant)
+            ]
+            dropped = len(questions) - len(answerable)
+            if dropped:
+                print(
+                    f"--limit-docs: {dropped} of {len(questions)} question(s) "
+                    "reference docs outside the kept corpus slice"
+                )
+            if args.limit_questions is not None:
+                questions = answerable[: args.limit_questions]
+            else:
+                questions = answerable
+        elif args.limit_questions is not None:
+            questions = questions[: args.limit_questions]
+        dataset = RAGDataset(documents=documents, questions=questions)
 
-    index_dir, answers_dir, _ = resolve_run_dirs(
+    index_dir, answers_dir, base_dir = resolve_run_dirs(
         args.output_dir, args.dataset_path, args.index_model
     )
     index_dir.mkdir(parents=True, exist_ok=True)
     answers_dir.mkdir(parents=True, exist_ok=True)
+
+    llm_counter = LLMCallCounter()
 
     llm_client = CachedAsyncOpenAI(
         base_url=args.openai_base_url,
@@ -211,6 +272,10 @@ def main() -> None:
         max_completion_tokens=args.max_completion_tokens,
     )
 
+    # Best-effort: RAGU's client wrapper may not expose chat.completions, in
+    # which case the summary simply carries no LLM-call counts.
+    attach_counter(llm_client, llm_counter)
+
     pipeline = RAGUPipeline(
         language='english',
         index_dir=index_dir,
@@ -232,7 +297,21 @@ def main() -> None:
     )
 
     if args.build_index:
-        pipeline.build_index(documents=list(dataset.documents.values()))
+        documents = list(dataset.documents.values())
+        # RAGU indexes the whole corpus in one call, so the timer records a
+        # single step covering every document rather than per-document rows.
+        with IndexTimer(
+            base_dir,
+            engine="ragu",
+            dataset=dataset_name_from_path(args.dataset_path),
+            model=args.index_model or args.builder_model_name,
+            counter=llm_counter,
+            total_units=len(documents),
+            extra={"query_engine": args.query_engine, "chunker": args.chunker},
+        ) as timer:
+            total_chars = sum(len(doc.text) for doc in documents if doc.text)
+            with timer.measure("<corpus>", total_chars, count=len(documents)):
+                pipeline.build_index(documents=documents)
 
     if args.answer:
         # Answer all questions within a single event loop so RAGU's shared HTTP
