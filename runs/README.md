@@ -71,6 +71,19 @@ actually reaches the engine (the answer path used to hardcode chunks on), and
 `--short-answers` fails loudly on a build whose engines have no
 `update_prompt()` instead of silently answering at full length.
 
+The decision-model flags (`--selector`, `--decision-model-name`, `--select-*`,
+`--ppr-*`) need RAGU with the `ragu.decision` package, which until it is merged
+upstream lives in the `feature/decision-model` branch of the fork:
+
+```bash
+pip install -e . && pip install --force-reinstall \
+    "graph-ragu @ git+https://github.com/XieN-N/RAGU.git@feature/decision-model"
+```
+
+Without these flags that build answers exactly like dev RAGU. With them on a
+build that lacks the feature, `RAGUPipeline` stops with an error instead of
+quietly running without selection.
+
 ## Quick Start — RAGU
 
 ```bash
@@ -133,6 +146,24 @@ python runs/ragu_run.py \
 | `--tokenizer-backend` | `TOKENIZER_BACKEND` | `tiktoken` | Tokenizer backend |
 | `--tokenizer-llm-name` | `TOKENIZER_LLM_NAME` | `gpt-4o` | Tokenizer model name (LLM) |
 | `--tokenizer-embedder-name` | `TOKENIZER_EMBEDDER_NAME` | `gpt-4o` | Tokenizer model name (embedder) |
+| `--index-dir` | `INDEX_DIR` | — | Read/write the index here instead of `<output-dir>/<dataset>/[<model>/]index`, so several answer variants share one index |
+| `--save-context` / `--no-save-context` | `SAVE_CONTEXT` | `false` | Write `answers/<i>.context.json`: context as the answer prompt saw it, its tokens, answer seconds, retrieval metrics (incl. per-stage `timing`) |
+| `--context-budget` | `CONTEXT_BUDGET` | engine default (30k) | Max context tokens for the answer prompt |
+| `--always-answer` / `--no-always-answer` | `ALWAYS_ANSWER` | `false` | With `--short-answers`: forbid "I don't know" (benchmarks where every question has an answer) |
+| `--selector` | `SELECTOR` | `none` | dev RAGU: `pointwise` (decision model) or `cosine` context selection in LocalSearch |
+| `--decision-model-name` | `DECISION_MODEL_NAME` | — | Model for the single-token decision model (same client as answers) |
+| `--decision-constraint` | `DECISION_CONSTRAINT` | `none` | `none`, `logit_bias` (OpenAI) or `allowed_token_ids` (vLLM) |
+| `--select-pool-entities/relations/chunks`, `--select-threshold`, `--select-floor`, `--select-top-entities/relations/chunks` | — | RAGU defaults | Selection pools and rules, see `ragu/search_engine/README.md` |
+| `--select-hops` | — | `1` | pointwise: hops walked from relations the decision model kept |
+| `--select-keep-seed-context` / `--no-select-keep-seed-context` | — | `false` | pointwise: keep the full seed context and append what further hops select |
+| `--ppr-chunks`, `--ppr-alpha` | — | `0`, `0.5` | Append Personalized PageRank chunks (seeded by the decision model when present) |
+
+All of these are off by default, so a run without them is the plain LocalSearch
+it always was. Best MuSiQue setup so far: `--short-answers --always-answer
+--selector pointwise --decision-model-name gpt-4o-mini --select-hops 2 --select-pool-chunks 30`
+(+3.8 pp answer correctness over the same prompt without the decision model on
+395 held-out questions; scripts and numbers in
+[runs_local/README.md](../runs_local/README.md#эксперименты-с-decision-model)).
 
 ## Query Engines
 

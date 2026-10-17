@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,16 @@ Context: {{ context }}
 
 Provide the answer in the following language: {{ language }}
 """
+
+# Same terse prompt without the right to abstain. On benchmarks where every
+# question has an answer (MuSiQue, 2Wiki), "I don't know" always scores zero,
+# while other systems (e.g. HippoRAG 2) always commit to their best guess.
+NO_ABSTAIN_SHORT_ANSWER_PROMPT = SHORT_ANSWER_PROMPT.replace(
+    "3. If the answer is not supported by the context, output exactly: I don't know.",
+    "3. Always give your single best answer, even if the context does not state it\n"
+    "   explicitly; never answer \"I don't know\".",
+)
+assert NO_ABSTAIN_SHORT_ANSWER_PROMPT != SHORT_ANSWER_PROMPT
 
 
 def _set_short_prompt(engine: Any, name: str, instruction: Any) -> None:
@@ -119,6 +130,12 @@ class RAGUPipeline(RAGPipeline):
         tokenizer_embedder_name: str = "gpt-4o",
         query_engine: str = "local",
         short_answers: bool = False,
+        no_abstain: bool = False,
+        max_context_length: int | None = None,
+        decision_llm: LLM | None = None,
+        decision_constraint: str = "none",
+        selector: str = "none",
+        select_options: dict[str, Any] | None = None,
     ):
         ragu_logger.remove()
         ragu_logger.add(sys.stdout, level="DEBUG")
@@ -132,6 +149,20 @@ class RAGUPipeline(RAGPipeline):
         self.query_use_chunks = query_use_chunks
         self.retrieval_top_k = retrieval_top_k
         self.qa_top_k = qa_top_k
+        # Retrieval-time selection (dev RAGU with ragu.decision only); empty
+        # options keep the engine defaults.
+        self.selector = selector
+        self.select_options = dict(select_options or {})
+        self.decision_model: Any = None
+        if decision_llm is not None:
+            from ragu.decision import DecisionModel
+            # One provider-rejected candidate (e.g. a content filter) must not turn
+            # the whole question into a placeholder answer.
+            self.decision_model = DecisionModel(  # type: ignore[call-arg]
+                decision_llm, constraint=decision_constraint, skip_failed_requests=True,  # type: ignore[arg-type]
+            )
+        if selector == "pointwise" and self.decision_model is None:
+            raise ValueError(f"selector={selector!r} needs a decision LLM (--decision-model-name)")
 
         Settings.storage_folder = self.index_dir
         Settings.language = self.language
@@ -227,7 +258,7 @@ class RAGUPipeline(RAGPipeline):
         def _short_instruction() -> RAGUInstruction:
             return RAGUInstruction(
                 messages=ChatMessages.from_messages(
-                    [UserMessage(content=SHORT_ANSWER_PROMPT)]
+                    [UserMessage(content=NO_ABSTAIN_SHORT_ANSWER_PROMPT if no_abstain else SHORT_ANSWER_PROMPT)]
                 ),
                 pydantic_model=str,
                 description="Brief extractive answer prompt for short-answer benchmarks.",
@@ -247,12 +278,22 @@ class RAGUPipeline(RAGPipeline):
                 _set_short_prompt(naive_search, "naive_search", _short_instruction())
             self.search_engine = naive_search
         else:
+            # Pass only kwargs the installed LocalSearchEngine accepts: the
+            # decision model exists only in builds with ragu.decision.
+            local_kwargs: dict[str, Any] = {
+                "tokenizer_model": "gpt-4o-mini",
+                "language": self.language,
+                "max_context_length": max_context_length,
+                "decision_model": self.decision_model,
+            }
+            local_params = inspect.signature(LocalSearchEngine.__init__).parameters
+            if self.decision_model is not None and "decision_model" not in local_params:
+                raise RuntimeError("This RAGU build's LocalSearchEngine has no decision_model")
             local_search = LocalSearchEngine(
                 self.assistant_llm,
                 self.knowledge_graph,
                 self.embedder,
-                tokenizer_model="gpt-4o-mini",
-                language=self.language,
+                **{k: v for k, v in local_kwargs.items() if k in local_params and v is not None},
             )
             self.local_search = local_search
             if short_answers:
@@ -291,6 +332,10 @@ class RAGUPipeline(RAGPipeline):
         if self.query_engine != "naive":
             options["use_chunks"] = self.query_use_chunks
             options["use_summary"] = self.query_use_summary
+            if self.selector != "none":
+                options["selector"] = self.selector
+            # select_options also carries selector-independent knobs (e.g. ppr_chunks)
+            options.update(self.select_options)
         return options
 
     def _call_args(self, top_k: int) -> tuple[tuple, dict]:
@@ -303,16 +348,27 @@ class RAGUPipeline(RAGPipeline):
         if self.params_class is None:
             return (), {}
         accepted = inspect.signature(self.params_class).parameters
+        if "selector" in options and "selector" not in accepted:
+            raise RuntimeError(f"{self.params_class.__name__} has no 'selector'; this RAGU build cannot select")
         return (self.params_class(**{k: v for k, v in options.items() if k in accepted}),), {}
 
     async def _answer(self, question: str, max_retries: int = 3) -> tuple[str, Any]:
         search_args, search_kwargs = self._call_args(self.retrieval_top_k)
         qa_args, qa_kwargs = self._call_args(self.qa_top_k)
         context: Any = None
+        self.last_answer_seconds = 0.0
         for attempt in range(max_retries):
+            started = time.perf_counter()
             try:
-                context = await self.search_engine.a_search(question, *search_args, **search_kwargs)
-                response = await self.search_engine.a_query(question, *qa_args, **qa_kwargs)
+                if self.uses_engine_params:
+                    # dev RAGU returns the retrieval it answered from, so one
+                    # retrieval per question is enough (and is what the answer saw).
+                    response = await self.search_engine.a_query(question, *qa_args, **qa_kwargs)
+                    context = getattr(response, "retrieval", None)
+                else:
+                    context = await self.search_engine.a_search(question, *search_args, **search_kwargs)
+                    response = await self.search_engine.a_query(question, *qa_args, **qa_kwargs)
+                self.last_answer_seconds = time.perf_counter() - started
             except Exception as exc:
                 # A single bad question (e.g. provider content-filter 400, which
                 # is not retryable) must not crash the whole batch. Log and
