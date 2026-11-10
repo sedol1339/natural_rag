@@ -348,8 +348,8 @@ DATASET_NAME=musique ANSWERS_DIR=generated/<RUN_ID>__gpt-4o-mini/musique/gigacha
 
 ## 6. Эксперименты с decision model
 
-Замеры decision model в RAGU (отбор контекста LocalSearch одним токеном и обход
-графа на несколько шагов) делались на MuSiQue по готовому индексу
+Замеры decision model в RAGU (отбор контекста одним токеном и обход графа на
+несколько шагов, сейчас это `DecisionSearchEngine`) делались на MuSiQue по готовому индексу
 `generated/ragu_musique/musique/gpt-oss-20b/index`. Ответы и решения даёт
 gpt-4o-mini через vsellm, оценивает gemini-3-flash-preview по протоколу
 GraphRAG-Benchmark. Нужны RAGU из ветки `feature/decision-model` форка (команда
@@ -371,7 +371,7 @@ runs_local/run_musique_variant.sh base 498
 ```
 
 ```bash
-runs_local/run_musique_variant.sh dm_h2p30_na 498 --always-answer --selector pointwise --decision-model-name gpt-4o-mini --select-hops 2 --select-pool-chunks 30
+runs_local/run_musique_variant.sh dm_h2p30_na 498 --always-answer --query-engine decision --decision-model-name gpt-4o-mini --select-hops 2 --select-pool-chunks 30
 ```
 
 Остальные варианты из замеров отличаются только флагами:
@@ -381,15 +381,27 @@ runs_local/run_musique_variant.sh dm_h2p30_na 498 --always-answer --selector poi
 | `base` | — (исходный LocalSearch) |
 | `base_na` | `--always-answer` |
 | `base800` | `--context-budget 800` |
-| `cosine` | `--selector cosine` |
-| `dm` | `--selector pointwise --decision-model-name gpt-4o-mini` |
+| `dm` | `--query-engine decision --decision-model-name gpt-4o-mini` |
 | `dm_h2p30` | `dm` + `--select-hops 2 --select-pool-chunks 30` |
 | `dm_h2p30_na` | `dm_h2p30` + `--always-answer` |
 | `aug_h2` | `dm_h2p30` + `--select-keep-seed-context` |
-| `ppr_dm`, `ppr_nodm` | `--ppr-chunks 5`, с decision model и без |
+| `*_r` | тот же вариант + `--reason-first` (короткое рассуждение перед ответом) |
 
 Повторный запуск с тем же именем пропускает готовые ответы, так что прерванный
 прогон просто запускается ещё раз.
+
+Варианты `cosine` (`--selector cosine`) и `ppr_dm`, `ppr_nodm` (`--ppr-chunks 5`)
+из замеров запускались со старыми флагами отбора в `LocalSearchEngine`. В движок они
+не перенесены, для их воспроизведения нужны коммит `14bbcd8` этого репозитория и
+коммит `7662b7e` форка RAGU.
+
+Проверка переноса отбора в движок: `replay_decisions.py` повторяет решения Meno-Lite
+из `itmo_results/calib.tar.gz` без запуска модели и сравнивает контексты с прогоном
+`meno_t01` дословно. Векторы запросов даёт сервер из раздела 1:
+
+```bash
+EMBED_BASE_URL=http://127.0.0.1:8002/v1 python runs_local/replay_decisions.py --ids 0-19
+```
 
 Оценка судьёй. Скрипт сам собирает `graphrag_bench_input.json` и оценивает только
 те вопросы диапазона, которых ещё нет ни в одном `eval_results*.json` варианта;
@@ -452,6 +464,98 @@ python runs_local/ppr_reachability.py --ids 0-99
 `dm_h2p30_na` лучше `base_na` на 3.8 пункта [+1.3; +6.4], то есть обход decision
 model даёт прирост и сверх промпта без отказа. Цена: ответ на вопрос 7.9 с против
 2.2 с, 96 запросов к decision model и около 0.41 рубля на генерацию против 0.087.
+
+---
+
+## 7. Судья YandexGPT и калибровка decision model через Brier
+
+### Судья YandexGPT
+
+Вместо gemini через vsellm можно оценивать YandexGPT (Yandex AI Studio, OpenAI-
+совместимый API). Сам протокол GraphRAG-Benchmark не меняется, но его
+эмбеддинговую часть Yandex принимает только по одному тексту и в формате float,
+поэтому оценка запускается через обёртку `runs_local/judge_yandex.py`: она
+подменяет класс эмбеддингов и запускает тот же `Evaluation.generation_eval`.
+Оценки пишутся в отдельные файлы `eval_results_yandex_*.json` (`PASS=yandex`),
+обычный проход их не учитывает, так что судьи не смешиваются.
+
+```bash
+export LLM_API_KEY=<ключ API Yandex Cloud> F=<id каталога>
+PASS=yandex JUDGE_WRAPPER=runs_local/judge_yandex.py JUDGE_CONCURRENCY=8 \
+JUDGE_BASE_URL=https://llm.api.cloud.yandex.net/v1 \
+JUDGE_MODEL="gpt://$F/yandexgpt-5.1/latest" JUDGE_EMBEDDING_MODEL="emb://$F/text-search-query/latest" \
+GRAPHRAG_BENCH_ROOT=<путь к GraphRAG-Benchmark> EVAL_PYTHON=<его python> \
+runs_local/eval_graphrag_bench.sh dm_h2p30_na 0 497
+```
+
+```bash
+python runs_local/compare_runs.py base base_na dm_h2p30_na --ids 100-497 --judge yandex
+```
+
+На 398 отложенных вопросах MuSiQue выводы двух судей совпали по знаку и
+значимости всех разниц (корреляция оценок по вопросам 0.84-0.87), но
+абсолютный уровень у YandexGPT выше примерно на 5 пунктов: другие эмбеддинги.
+Сравнивать можно только варианты, оценённые одним судьёй.
+
+Для 2WikiMultiHopQA (один json-файл, без `questions.jsonl`) скрипту оценки
+нужен `DATASET_PATH=datasets/2wikimultihopqa/2wikimultihopqa.json`, а
+`compare_runs.py` — `--dataset 2wikimultihopqa --dataset-path ...`. Вариант
+на другом графе записывается как `вариант@индекс`, например `meno_base@MenoLite`.
+
+### Калибровка через Brier
+
+Вариант без рассуждения из OpenJev-RLCD (arXiv 2609.38850): ответ «да/нет»
+decision model по первому токену дообучается строго собственным правилом
+оценки (Brier) в виде LoRA-адаптера. Отвечает при этом базовая модель, адаптер
+только решает. Шаги:
+
+1. Собрать размеченные промпты из кэшей LLM прошлых прогонов (там лежит каждый
+   запрос decision model с точным промптом). Метка: чанк из gold-документа
+   вопроса; ребро или сущность, извлечённые из такого чанка.
+
+```bash
+python runs_local/harvest_decisions.py --dataset-path datasets/2wikimultihopqa/2wikimultihopqa.json \
+  --index-dir generated/ragu_2wikimultihopqa/2wikimultihopqa/gpt-oss-20b/index \
+  --cache tmp/llm_cache_meno_dm --cache tmp/llm_cache_meno_t01 --out decisions_2wiki.jsonl
+```
+
+2. Посмотреть калибровку и ранжирование исходной модели (Brier, ECE, AUROC,
+   AURC; Platt на dev):
+
+```bash
+python runs_local/calibration_report.py decisions_musique.jsonl --dev 0-99 --test 100-497
+```
+
+3. Обучить адаптер (нужны GPU, torch, `transformers<5`, `peft`). Скрипт в
+   начале сверяет P(Y) со значениями из кэша vLLM; расхождение больше ~0.02
+   значит, что промпт или шаблон не совпадают с инференсом.
+
+```bash
+python runs_local/train_brier_readout.py --model <путь к meno-lite-0.1> \
+  --train decisions_2wiki.jsonl --train-ids 0-449 --val-ids 450-499 --out adapters/meno-brier
+```
+
+4. Поднять vLLM с адаптером (`--enable-lora --max-lora-rank 16
+   --lora-modules meno-brier=<путь>`), переоценить промпты и сравнить:
+
+```bash
+python runs_local/rescore_decisions.py --base-url http://127.0.0.1:8711/v1 --model meno-brier \
+  --ids 100-497 decisions_musique.jsonl --out rescored_musique.jsonl
+```
+
+```bash
+python runs_local/calibration_report.py rescored_musique.jsonl --score p_score --dev 0-99 --test 100-497
+```
+
+5. Ответить с адаптером в роли decision model: `--decision-model-name meno-brier`,
+   отвечающая модель прежняя (`ANSWER_MODEL=meno-lite-0.1`), порог выбрать на dev.
+
+Подводные камни. Учить и проверять на разных вопросах (лучше на разных
+датасетах); позитивы не пересэмплировать, иначе калибровка ломается. Метки
+слабые: «из нужного абзаца» не то же, что «нужно для ответа». На Meno-Lite
+адаптер, обученный на 2Wiki 0-449, поднял AUROC решений на MuSiQue с 0.71 до
+0.90, на BioASQ с 0.84 до 0.87, но качество ответов выросло только на 2Wiki
+(+4.5 пункта к исходной Meno-Lite); подробности в отчётах проекта.
 
 ---
 
